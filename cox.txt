@@ -1,0 +1,157 @@
+#Для Cox
+import lifelines
+from lifelines import *
+from lifelines import CoxTimeVaryingFitter
+from lifelines.utils import pass_for_numeric_dtypes_or_raise_array
+import scipy.optimize
+
+#COX
+def _compute_baseline_survival_custom(ctv, df):
+
+    df = df.copy()
+
+    if ctv.weights_col is None:
+        assert "__weights" not in df.columns, "__weights is an internal lifelines column, please rename your column first."
+        df["__weights"] = 1.0
+
+    df = df.rename(columns={ctv.event_col: "event", ctv.start_col: "start", 
+                            ctv.stop_col: "stop", ctv.weights_col: "__weights"})
+
+    events, start, stop = (
+        df.pop("event").astype(bool),
+        df.pop("start"),
+        df.pop("stop"),
+    )
+    weights = df.pop("__weights").astype(np.float32)
+
+    unique_death_times = np.unique(stop[events.values])
+    baseline_survival = pd.DataFrame(np.zeros_like(unique_death_times), 
+                                     index=unique_death_times, 
+                                     columns=['S0_diff'])
+
+    hazards = np.exp(df[ctv.params_.index].values @ ctv.params_.values)
+
+    np.seterr(over='ignore')
+    for t in unique_death_times:
+        id_at_risk = (t > start.values) & (t <= stop.values)
+
+        stops_at_t = stop.values[id_at_risk]
+        events_at_t = events.values[id_at_risk] & (stops_at_t == t)
+        weights_at_t = weights.values[id_at_risk]
+        hazards_at_t = hazards[id_at_risk]
+
+        hazards_at_event_at_t = hazards_at_t[events_at_t]
+
+        events_at_t_sum = (weights_at_t.squeeze() * events_at_t).sum()
+        hazards_at_t_sum = np.sum(hazards_at_t)
+        init_val = np.exp(-events_at_t_sum/hazards_at_t_sum) # начальное значение
+
+        # базовая выживаемость - решение данного уравнения по 'с' [где g(x)=exp(Xb)] :
+        # sum[по выбывшим](g(x) / (1 - c^g(x))) = sum[по всем](g(x))
+        f = lambda c: (
+            np.sum(hazards_at_event_at_t / (1 - c**hazards_at_event_at_t)) - hazards_at_t_sum
+        ) ** 2
+        baseline_survival.loc[t] = scipy.optimize.minimize(f, init_val, method='l-bfgs-b', bounds=[(1e-8,1-1e-8)]).x
+    np.seterr(over='warn')
+
+    # Заполняем пропущенные периоды
+    baseline_survival = baseline_survival.merge(
+        pd.DataFrame(index = range(1, max(stop)+1)),
+        how = 'outer', left_index=True, right_index = True
+        ).fillna(1)
+
+    return baseline_survival
+
+def baseline_survival_stata_VaryingFitter (model, df, start, end, event, baseline_survival):
+    df = df.copy(deep=True)
+    # 0. Расчет базовой вероятности дожития () 
+    #baseline_survival = baseline_survival_stata(ctv, df, start, end, event)
+
+    # 1.Подготовка вероятностей дожитий к сцепке
+    # Трансформация индексов в поле "end" (== исходному полю "months")
+    baseline_survival.reset_index(level=0, inplace = True)
+    baseline_survival.rename(columns={'index': end}, inplace=True)
+    
+    baseline_survival['baseline survival']  = baseline_survival['S0_diff'].cumprod()
+    
+    # Расчет вероятности выжить в конкретный период - для воспроизведения итоговой выживаемости 
+    baseline_survival['pre_S0'] = baseline_survival['baseline survival']/baseline_survival['baseline survival'].shift(1)
+    baseline_survival['pre_S0'] = baseline_survival['pre_S0'].fillna(baseline_survival['baseline survival'][0])
+
+    # 2. Расчет итоговой вероятности дожитий
+    #Расчет суммы произведений иксов на их коэффциенты
+    x_list = list(model.params_.index) # Список с названиеями иксов
+    df['X*b'] = df[x_list].values @ model.params_.loc[x_list].values
+
+    # Взятие экспоненты от полученного значения
+    df['exp(X*b)'] = np.exp(df['X*b'])
+
+    # Добавление ранее посчитанной базовой вероятности "выжить" в каждый день t (pre_S0)
+    df = pd.merge(df, baseline_survival, how='left', on=[end])
+
+    # Расчет итоговой вероятности того, что клиент не уйдет в день t
+    df['pre_predict_Cox'] = df['pre_S0']**df['exp(X*b)']
+
+
+    # Рассчет итоговой условной вероятности дожития по каждому клиенту (перемножим вероятности)
+    df['predict_Cox'] = df.groupby('host_agr_trade_id')['pre_predict_Cox'].cumprod()
+    df.drop(columns=['baseline survival','pre_S0','X*b','exp(X*b)','pre_predict_Cox'], inplace=True)
+
+    return df
+
+#ПРИМЕР
+def cox (df) :
+    
+    coeffs_cox = {}
+    s0_dict = {}
+    df_cox = df[df['report_dt'] <= df['close_dt']] 
+    #Создаем вектор переменных моделей 
+    df_cox[vars_for_cox] = df_cox[vars_for_cox].astype('int64')
+
+    #Модель Сox
+    ctv = CoxTimeVaryingFitter()
+    ctv.fit(df_cox[vars_for_cox], event_col="event", start_col="start", stop_col="LP")
+    ctv.print_summary()
+    s0 = _compute_baseline_survival_custom(ctv, df_cox)
+    print(s0)
+
+    #заполняем справочник
+    #записываю коэффициенты в одиг файл 
+    coeffs_cox['coeffs_cox']  = ctv.params_.combine(
+        pd.Series(None, index = vars_for_cox, dtype=np.float32), max, fill_value=0)[vars_for_cox]  
+
+    coeffs_cox['coeffs_cox'] = coeffs_cox[f'coeffs_cox'].drop(['LP', 'start', 'event'], axis=0)
+    s0_dict['s0_diff'] = s0
+    s0_dict['s0_diff'].reset_index(inplace = True)
+    s0_dict['s0_diff'] = s0_dict['s0_diff'].drop(['index'], axis=1)
+    
+    df_120 = pd.DataFrame({'S0_diff' : [s0_dict['s0_diff']['S0_diff'].iloc[-6:].mean().item()]}, columns = ['S0_diff'])
+    s0_dict['s0_diff'] = s0_dict['s0_diff'].append([df_120]*(120 - s0_dict['s0_diff']['S0_diff'].index.max()))
+    s0_dict['s0_diff'].reset_index(inplace = True)
+    s0_dict['s0_diff'] = s0_dict['s0_diff'].drop(['index'], axis=1)
+    
+    Path(f'{root_path}/coeffs/{str_date}/').mkdir(parents = True, exist_ok = True)
+    path = f'{root_path}/coeffs/{str_date}/coeffs_{service_model}.pkl'
+
+    if os.path.isfile(path):
+        with open(path, 'r+b') as f:
+            temp = pickle.load(f)
+            f.seek(0)
+            temp.update(s0_dict)
+            temp.update(coeffs_cox)
+            pickle.dump(temp, f)
+            f.truncate()
+            del temp
+    else:
+        with open(path, 'wb') as f:
+            pickle.dump(s0_dict, f)
+        with open(path, 'r+b') as f:
+            temp = pickle.load(f)
+            f.seek(0)
+            temp.update(s0_dict)
+            temp.update(coeffs_cox)
+            pickle.dump(temp, f)
+            f.truncate()
+            del temp
+    
+    return df
