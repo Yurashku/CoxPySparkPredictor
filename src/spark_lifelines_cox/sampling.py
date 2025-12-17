@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from pyspark.sql import DataFrame, Window
 from pyspark.sql.functions import col, count, lit, rand, row_number
 
@@ -10,7 +12,7 @@ def cap_sample_by_key(
     sdf: DataFrame,
     key_col: str,
     max_rows_per_key: int,
-    seed: int | None = None,
+    seed: Optional[int] = None,
 ) -> DataFrame:
     """Limit rows per key using deterministic random sampling.
 

@@ -30,10 +30,10 @@ class SparkCoxPHByType:
         feature_cols: Iterable[str],
         max_rows_per_type: int = 500_000,
         min_events_per_type: int = 5,
-        penalizer: float | None = 0.0,
-        l1_ratio: float | None = 0.0,
+        penalizer: Optional[float] = 0.0,
+        l1_ratio: Optional[float] = 0.0,
         baseline_estimation_method: str = "breslow",
-        seed: int | None = None,
+        seed: Optional[int] = None,
         unknown_type_policy: str = "null",
         null_policy: str = "nan",
     ) -> None:
