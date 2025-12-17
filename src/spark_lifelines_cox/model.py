@@ -46,15 +46,19 @@ class TypeArtifacts:
             return float(self.baseline_survival[t])
         return float(self.baseline_survival[-1])
 
-    def extend_baseline(self, max_time: int, extend_fn=None, tail_k: int = 6) -> None:
+    def extend_baseline(self, max_time: int, extend_fn=None, tail_k: int = 12) -> None:
         current_T = len(self.baseline_survival) - 1
         if max_time <= current_T:
             return
         tail_start = max(1, len(self.baseline_ratio) - tail_k)
         tail_values = np.array(self.baseline_ratio[tail_start:])
         if extend_fn is None:
-            fill_values = float(np.mean(tail_values)) if len(tail_values) else 1.0
-            new_ratios = np.full(max_time - current_T, fill_values, dtype=float)
+            if len(tail_values) == 0:
+                new_ratios = np.ones(max_time - current_T, dtype=float)
+            else:
+                repeated = np.resize(tail_values[-12:], 12)
+                cycle = np.resize(repeated, max_time - current_T)
+                new_ratios = np.array(cycle, dtype=float)
         else:
             new_times = np.arange(current_T + 1, max_time + 1, dtype=int)
             new_ratios = np.array(extend_fn(tail_values, new_times), dtype=float)
@@ -140,6 +144,8 @@ class SparkCoxPHByType:
         seed: Optional[int] = None,
         unknown_type_policy: str = "null",
         null_policy: str = "nan",
+        trim_tail_on_wide_ci: bool = True,
+        ci_width_quantile: float = 0.9,
     ) -> None:
         self.type_col = type_col
         self.duration_col = duration_col
@@ -153,6 +159,8 @@ class SparkCoxPHByType:
         self.seed = seed
         self.unknown_type_policy = unknown_type_policy
         self.null_policy = null_policy
+        self.trim_tail_on_wide_ci = trim_tail_on_wide_ci
+        self.ci_width_quantile = ci_width_quantile
 
         self.artifacts: Dict[str, TypeArtifacts] = {}
         self.skipped: Dict[str, str] = {}
@@ -162,7 +170,9 @@ class SparkCoxPHByType:
         return SparkSession.getActiveSession()  # type: ignore[return-value]
 
     def fit(self, sdf: DataFrame) -> "SparkCoxPHByType":
+        print("[SparkCoxPHByType] Starting fit pipeline")
         ensure_columns_exist(sdf, [self.type_col, self.duration_col, self.event_col, *self.feature_cols])
+        print("[SparkCoxPHByType] Casting columns to numeric types")
         sdf = cast_columns(
             sdf,
             {
@@ -172,6 +182,10 @@ class SparkCoxPHByType:
             },
         )
         sdf = sdf.filter(col(self.duration_col) >= 0)
+        print(
+            "[SparkCoxPHByType] Applying cap-sampling by type with max_rows_per_type=",
+            self.max_rows_per_type,
+        )
         sdf = cap_sample_by_key(sdf, self.type_col, self.max_rows_per_type, seed=self.seed)
 
         schema = StructType(
@@ -184,10 +198,15 @@ class SparkCoxPHByType:
 
         def train(pdf: pd.DataFrame) -> pd.DataFrame:
             type_value = str(pdf[self.type_col].iloc[0])
+            print(f"[SparkCoxPHByType][{type_value}] Start training on {len(pdf)} rows")
             pdf = pdf.dropna()
             if pdf.empty:
+                print(f"[SparkCoxPHByType][{type_value}] Skipped because dataset is empty")
                 return pd.DataFrame({self.type_col: [type_value], "payload": [None], "status": ["empty"]})
             if pdf[self.event_col].sum() < self.min_events_per_type:
+                print(
+                    f"[SparkCoxPHByType][{type_value}] Skipped because events < min_events_per_type"
+                )
                 return pd.DataFrame({
                     self.type_col: [type_value],
                     "payload": [None],
@@ -216,6 +235,29 @@ class SparkCoxPHByType:
             s0 = survival_series.ffill().fillna(1.0).to_numpy()
             ratios = np.ones_like(s0)
             ratios[1:] = s0[1:] / s0[:-1]
+            durations_int = pdf_local[self.duration_col].astype(int).to_numpy()
+            events_mask = pdf_local[self.event_col].to_numpy() == 1
+            event_durations = durations_int[events_mask]
+            max_time = int(timeline[-1])
+            event_hist = np.bincount(event_durations, minlength=max_time + 1)
+            at_risk_hist = np.bincount(durations_int, minlength=max_time + 1)
+            at_risk = np.cumsum(at_risk_hist[::-1])[::-1]
+            var_terms = np.zeros_like(s0)
+            valid = (event_hist > 0) & (at_risk > event_hist)
+            var_terms[valid] = event_hist[valid] / (at_risk[valid] * (at_risk[valid] - event_hist[valid]))
+            cumulative_var = np.cumsum(var_terms)
+            ci_widths = 1.96 * np.sqrt(cumulative_var)
+            trim_threshold = float(np.quantile(ci_widths, self.ci_width_quantile))
+            trim_idx = len(s0)
+            if self.trim_tail_on_wide_ci:
+                while trim_idx > 1 and ci_widths[trim_idx - 1] >= trim_threshold:
+                    trim_idx -= 1
+                if trim_idx < len(s0):
+                    print(
+                        f"[SparkCoxPHByType][{type_value}] Trimming trailing hazards: removed {len(s0) - trim_idx} points"
+                    )
+                    s0 = s0[:trim_idx]
+                    ratios = ratios[:trim_idx]
             artifacts = TypeArtifacts(
                 type_value=type_value,
                 beta={k: float(v) for k, v in cph.params_.to_dict().items()},
@@ -231,6 +273,7 @@ class SparkCoxPHByType:
                 baseline_method=self.baseline_estimation_method,
             )
             payload = json.dumps(artifacts.__dict__)
+            print(f"[SparkCoxPHByType][{type_value}] Training finished")
             return pd.DataFrame({self.type_col: [type_value], "payload": [payload], "status": ["ok"]})
 
         results = (
@@ -248,11 +291,15 @@ class SparkCoxPHByType:
                 training.add(type_value, None, row["status"])
         self.artifacts = training.artifacts_by_type
         self.skipped = training.skipped
+        print(
+            f"[SparkCoxPHByType] Training completed. Fitted types: {len(self.artifacts)}, skipped: {len(self.skipped)}"
+        )
         return self
 
     def extend_baselines(
-        self, max_time: int, extend_fn: Optional[Callable] = None, tail_k: int = 6
+        self, max_time: int, extend_fn: Optional[Callable] = None, tail_k: int = 12
     ) -> None:
+        print(f"[SparkCoxPHByType] Extending baselines to max_time={max_time}")
         for art in self.artifacts.values():
             art.extend_baseline(max_time=max_time, extend_fn=extend_fn, tail_k=tail_k)
 
@@ -271,6 +318,7 @@ class SparkCoxPHByType:
         if t_col:
             ensure_columns_exist(sdf, [t_col])
         sdf = cast_columns(sdf, {c: "double" for c in self.feature_cols})
+        print("[SparkCoxPHByType] Building survival UDF for prediction")
         udf = build_survival_udf(
             spark=self.spark,
             artifacts=self.artifacts,
@@ -281,10 +329,12 @@ class SparkCoxPHByType:
         cols = [col(self.type_col)] + [col(c) for c in self.feature_cols]
         if t_col:
             cols.append(col(t_col))
+        print("[SparkCoxPHByType] Starting prediction DataFrame transformation")
         result = sdf.withColumn(output_col, udf(*cols))
         return result
 
     def save(self, path: str) -> None:
+        print(f"[SparkCoxPHByType] Saving artifacts to {path}")
         save_artifacts(path, self.artifacts, self.skipped, self._config_dict())
 
     def _config_dict(self) -> Dict[str, object]:
@@ -301,10 +351,13 @@ class SparkCoxPHByType:
             "seed": self.seed,
             "unknown_type_policy": self.unknown_type_policy,
             "null_policy": self.null_policy,
+            "trim_tail_on_wide_ci": self.trim_tail_on_wide_ci,
+            "ci_width_quantile": self.ci_width_quantile,
         }
 
     @classmethod
     def load(cls, path: str) -> "SparkCoxPHByType":
+        print(f"[SparkCoxPHByType] Loading artifacts from {path}")
         artifacts, skipped, config = load_artifacts(path)
         if not artifacts:
             raise CoxModelError("No artifacts found in path")
@@ -321,6 +374,8 @@ class SparkCoxPHByType:
             seed=config.get("seed"),
             unknown_type_policy=config.get("unknown_type_policy", "null"),
             null_policy=config.get("null_policy", "nan"),
+            trim_tail_on_wide_ci=bool(config.get("trim_tail_on_wide_ci", True)),
+            ci_width_quantile=float(config.get("ci_width_quantile", 0.9)),
         )
         model.artifacts = artifacts
         model.skipped = skipped
@@ -328,6 +383,7 @@ class SparkCoxPHByType:
 
     @classmethod
     def from_config(cls, path: str) -> "SparkCoxPHByType":
+        print(f"[SparkCoxPHByType] Loading configuration only from {path}")
         _, _, config = load_artifacts(path)
         if not config:
             raise CoxModelError("No configuration found in artifacts file")
@@ -344,4 +400,6 @@ class SparkCoxPHByType:
             seed=config.get("seed"),
             unknown_type_policy=config.get("unknown_type_policy", "null"),
             null_policy=config.get("null_policy", "nan"),
+            trim_tail_on_wide_ci=bool(config.get("trim_tail_on_wide_ci", True)),
+            ci_width_quantile=float(config.get("ci_width_quantile", 0.9)),
         )
