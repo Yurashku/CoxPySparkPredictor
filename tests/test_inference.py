@@ -37,10 +37,15 @@ def test_survival_monotonic(spark):
         assert r.s10 <= r.s5
 
 
-def test_period_probability(spark):
+def test_save_load_and_config(spark, tmp_path):
     model, sdf = build_model(spark)
-    long_df = sdf.withColumn("period", sdf.duration.cast("int")).select("type", "x", "period")
-    pred = model.predict_period_event_prob(long_df, period_col="period", output_col="p_event")
-    rows = pred.select("p_event").collect()
-    for r in rows:
-        assert r.p_event is None or (0 <= r.p_event <= 1)
+    csv_path = tmp_path / "cox_artifacts.csv"
+    model.save(str(csv_path))
+
+    loaded = SparkCoxPHByType.load(str(csv_path))
+    pred_loaded = loaded.predict_survival_at_t(sdf, t=5, output_col="s5")
+    assert pred_loaded.count() == sdf.count()
+
+    cfg_only = SparkCoxPHByType.from_config(str(csv_path))
+    assert cfg_only.feature_cols == model.feature_cols
+    assert cfg_only.type_col == model.type_col

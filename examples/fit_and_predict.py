@@ -31,12 +31,9 @@ if __name__ == "__main__":
     pred = model.predict_survival_at_t(sdf, t=10)
     pred.show(5, truncate=False)
 
-    model.save("/tmp/cox_model")
-    loaded = SparkCoxPHByType.load("/tmp/cox_model")
-    pred2 = loaded.predict_period_event_prob(
-        sdf.withColumn("period", sdf.duration.cast("int")),
-        period_col="period",
-    )
+    model.save("/tmp/cox_model.csv")
+    loaded = SparkCoxPHByType.load("/tmp/cox_model.csv")
+    pred2 = loaded.predict_survival_at_t(sdf, t=10)
     pred2.show(5, truncate=False)
 
     spark.stop()
