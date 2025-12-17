@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,7 +15,7 @@ UNKNOWN_TYPE_NULL = "null"
 
 
 class _BroadcastArtifacts:
-    def __init__(self, feature_order: list[str], artifacts: Dict[str, TypeArtifacts]):
+    def __init__(self, feature_order: List[str], artifacts: Dict[str, TypeArtifacts]):
         self.feature_order = feature_order
         self.artifacts = artifacts
 
@@ -87,7 +85,7 @@ class _BroadcastArtifacts:
 def build_survival_udf(
     spark: SparkSession,
     artifacts: Dict[str, TypeArtifacts],
-    feature_cols: list[str],
+    feature_cols: List[str],
     unknown_policy: str,
     t: Optional[int],
 ):
@@ -98,7 +96,7 @@ def build_survival_udf(
 def build_period_prob_udf(
     spark: SparkSession,
     artifacts: Dict[str, TypeArtifacts],
-    feature_cols: list[str],
+    feature_cols: List[str],
     unknown_policy: str,
 ):
     broadcasted = spark.sparkContext.broadcast(_BroadcastArtifacts(feature_cols, artifacts))

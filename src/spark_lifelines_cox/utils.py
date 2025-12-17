@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def deterministic_seed(seed: int | None = None, extra: int | None = None) -> int:
+def deterministic_seed(seed: Optional[int] = None, extra: Optional[int] = None) -> int:
     """Return a deterministic non-negative seed combining base seed and optional extra."""
     base = seed if seed is not None else 0
     if extra is not None:

@@ -17,8 +17,8 @@ class TypeArtifacts:
     sample_size: int
     event_count: int
     fitted_at: str
-    penalizer: float | None
-    l1_ratio: float | None
+    penalizer: Optional[float]
+    l1_ratio: Optional[float]
     feature_cols: List[str]
     baseline_method: str
 
@@ -59,7 +59,7 @@ class TrainingResult:
     artifacts_by_type: Dict[str, TypeArtifacts] = field(default_factory=dict)
     skipped: Dict[str, str] = field(default_factory=dict)
 
-    def add(self, type_value: str, artifacts: TypeArtifacts | None, reason: Optional[str]) -> None:
+    def add(self, type_value: str, artifacts: Optional[TypeArtifacts], reason: Optional[str]) -> None:
         if artifacts is not None:
             self.artifacts_by_type[type_value] = artifacts
         elif reason:
