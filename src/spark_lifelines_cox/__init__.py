@@ -1,5 +1,4 @@
-"""Utilities for training lifelines Cox models on Spark."""
+from .model import BaselinePipeline, BaselinePipelineConfig
+from .utils import BaselineModel
 
-from .model import SparkCoxPHByType
-
-__all__ = ["SparkCoxPHByType"]
+__all__ = ["BaselinePipeline", "BaselinePipelineConfig", "BaselineModel"]

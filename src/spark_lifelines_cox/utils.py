@@ -1,80 +1,183 @@
 from __future__ import annotations
 
 import json
-import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional
 
-from pyspark.sql import DataFrame, Window
-from pyspark.sql.functions import col, count, lit, rand, row_number
-
-logger = logging.getLogger(__name__)
-
-
-def deterministic_seed(seed: Optional[int] = None, extra: Optional[int] = None) -> int:
-    """Возвращает детерминированное неотрицательное зерно с учётом базового seed и дополнительного смещения."""
-    base = seed if seed is not None else 0
-    if extra is not None:
-        base = (base * 31 + extra) % (2**31 - 1)
-    return base
+import numpy as np
+from lifelines import CoxPHFitter
+from pyspark.ml.linalg import DenseVector, SparseVector
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
 
-def safe_json_dump(obj: Any) -> str:
-    """Сериализует объект в JSON-строку без лишних пробелов, чтобы сохранять компактные артефакты."""
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+@dataclass
+class BaselineModel:
+    model_key: str
+    weights: List[float]
+    baseline_survival: List[float]
+    sample_size: int
 
 
-def safe_json_load(data: str) -> Any:
-    """Декодирует JSON-строку, возвращая оригинальные артефакты или конфиг."""
-    return json.loads(data)
+CONFIG_ROW_TYPE = "__config__"
 
 
-def now_utc_iso() -> str:
-    """Фиксирует текущий UTC без микросекунд в ISO-формате для единообразных меток времени."""
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def _vector_size(sample: Iterable[DenseVector | SparseVector]) -> int:
+    for v in sample:
+        return int(v.size)
+    raise ValueError("Vector column is empty; cannot infer dimensionality")
 
 
-class CoxModelError(RuntimeError):
-    """Исключение верхнего уровня для ошибок, связанных с обучением или инференсом модели Cox."""
-    pass
+def _vector_to_columns(pdf, vector_col: str, prefix: str = "f"):
+    vectors = pdf[vector_col]
+    size = _vector_size(vectors)
+    feature_matrix = np.vstack([np.array(v.toArray()) for v in vectors])
+    for idx in range(size):
+        pdf[f"{prefix}{idx}"] = feature_matrix[:, idx]
+    return pdf.drop(columns=[vector_col]), [f"{prefix}{idx}" for idx in range(size)]
 
 
-def log_skip(type_value: Any, reason: str) -> None:
-    """Записывает причину пропуска типа, чтобы легче отлаживать пайплайн."""
-    logger.warning("Skipping type %s: %s", type_value, reason)
+def _hazard_sequence(cph: CoxPHFitter) -> List[float]:
+    hazard_series = cph.baseline_hazard_.iloc[:, 0]
+    durations = [int(round(v)) for v in hazard_series.index.to_list()]
+    values = hazard_series.to_list()
+    if not durations:
+        return []
+
+    max_t = max(durations)
+    hazard: List[float] = []
+    last_value = values[0]
+    duration_iter = iter(zip(durations, values))
+    current_duration, current_value = next(duration_iter)
+
+    for t in range(1, max_t + 1):
+        if t == current_duration:
+            last_value = current_value
+            try:
+                current_duration, current_value = next(duration_iter)
+            except StopIteration:
+                current_duration = max_t + 1
+        hazard.append(float(last_value))
+    return hazard
 
 
-def ensure_columns_exist(df: DataFrame, cols: List[str]) -> None:
-    """Проверяет наличие обязательных колонок в DataFrame, чтобы упасть раньше с понятной ошибкой."""
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"DataFrame is missing required columns: {missing}")
+def _extend_hazard(hazard: List[float], target_length: int, tail_cycle: int = 12) -> List[float]:
+    if target_length <= len(hazard):
+        return hazard[:target_length]
+    if not hazard:
+        return [1.0] * target_length
+    cycle = hazard[-tail_cycle:] if len(hazard) >= tail_cycle else hazard
+    cycle = (cycle * (target_length // len(cycle) + 1))[: target_length - len(hazard)]
+    return hazard + cycle
 
 
-def cast_columns(df: DataFrame, casts: Dict[str, str]) -> DataFrame:
-    """Приводит указанные колонки к нужным типам, чтобы избежать сюрпризов при работе Spark с double/int."""
-    for name, dtype in casts.items():
-        if name in df.columns:
-            df = df.withColumn(name, col(name).cast(dtype))
-    return df
+def _hazard_to_survival(hazard: List[float]) -> List[float]:
+    survival = [1.0]
+    for h in hazard:
+        survival.append(float(survival[-1] * np.exp(-h)))
+    return survival
 
 
-def cap_sample_by_key(
-    sdf: DataFrame,
-    key_col: str,
-    max_rows_per_key: int,
-    seed: Optional[int] = None,
-) -> DataFrame:
-    """Ограничивает число строк на ключ с детерминированной случайной выборкой, чтобы защищаться от перекоса крупных групп."""
+def build_baseline_model(
+    pdf,
+    model_key: str,
+    duration_col: str,
+    event_col: str,
+    vector_col: str,
+    max_length: int,
+    tail_cycle: int,
+) -> Optional[BaselineModel]:
+    if len(pdf) == 0:
+        return None
+    if pdf[event_col].sum() == 0:
+        return None
+    pdf = pdf.copy()
+    pdf[duration_col] = pdf[duration_col].astype(int)
+    pdf[event_col] = pdf[event_col].astype(int)
+    pdf, feature_cols = _vector_to_columns(pdf, vector_col)
+    pdf = pdf[[duration_col, event_col, *feature_cols]]
 
-    if max_rows_per_key <= 0:
-        return sdf
-
-    counts = sdf.groupBy(key_col).agg(count(lit(1)).alias("cnt"))
-    sdf_with_count = sdf.join(counts, on=key_col, how="left")
-    # rn служит порядковым номером внутри группы: он позволяет отсечь строки сверх лимита при избыточных группах
-    window = Window.partitionBy(key_col).orderBy(rand(deterministic_seed(seed)))
-    sampled = sdf_with_count.withColumn("rn", row_number().over(window)).where(
-        (col("cnt") <= lit(max_rows_per_key)) | (col("rn") <= lit(max_rows_per_key))
+    cph = CoxPHFitter()
+    cph.fit(pdf, duration_col=duration_col, event_col=event_col)
+    hazard = _extend_hazard(_hazard_sequence(cph), target_length=max_length, tail_cycle=tail_cycle)
+    survival = _hazard_to_survival(hazard)
+    weights = cph.params_.reindex(feature_cols).to_numpy(dtype=float).tolist()
+    return BaselineModel(
+        model_key=model_key,
+        weights=weights,
+        baseline_survival=survival,
+        sample_size=len(pdf),
     )
-    return sampled.drop("rn", "cnt")
+
+
+def save_models(path: str, config: Dict[str, object], models: Dict[str, BaselineModel]) -> None:
+    rows = [
+        {"type": CONFIG_ROW_TYPE, "payload": json.dumps(config, ensure_ascii=False, separators=(",", ":"))}
+    ]
+    for key, model in models.items():
+        rows.append({
+            "type": key,
+            "payload": json.dumps(model.__dict__, ensure_ascii=False, separators=(",", ":")),
+        })
+    schema = T.StructType(
+        [
+            T.StructField("type", T.StringType(), False),
+            T.StructField("payload", T.StringType(), False),
+        ]
+    )
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        raise RuntimeError("Spark session is not active")
+    spark.createDataFrame(rows, schema=schema).coalesce(1).write.mode("overwrite").csv(path, header=True)
+
+
+def load_models(path: str) -> tuple[Dict[str, BaselineModel], Dict[str, object]]:
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        raise RuntimeError("Spark session is not active")
+    df = spark.read.option("header", True).csv(path)
+    rows = df.collect()
+    models: Dict[str, BaselineModel] = {}
+    config: Dict[str, object] = {}
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if row["type"] == CONFIG_ROW_TYPE:
+            config = payload
+            continue
+        models[str(row["type"])] = BaselineModel(**payload)
+    return models, config
+
+
+def build_baseline_column(models: Dict[str, BaselineModel]) -> F.Column:
+    items = []
+    for key, model in models.items():
+        items.append(F.lit(key))
+        baseline_array = F.array([F.lit(float(v)) for v in model.baseline_survival])
+        items.append(baseline_array)
+    return F.create_map(*items)
+
+
+def attach_baseline(sdf: DataFrame, key_col: str, models: Dict[str, BaselineModel], output_col: str) -> DataFrame:
+    mapping_col = build_baseline_column(models)
+    return sdf.withColumn(output_col, mapping_col.getItem(F.col(key_col)))
+
+
+def adjust_survival_tail(sdf: DataFrame, duration_col: str, baseline_col: str, output_col: str) -> DataFrame:
+    def _trim_and_scale(baseline: Optional[List[float]], lived: Optional[int]):
+        if baseline is None or lived is None:
+            return None
+        lived_int = int(lived)
+        if lived_int < 0:
+            return baseline
+        if lived_int >= len(baseline):
+            return [1.0]
+        tail = baseline[lived_int:]
+        start = tail[0]
+        if start == 0:
+            return [float("nan") for _ in tail]
+        return [float(v / start) for v in tail]
+
+    udf = F.udf(_trim_and_scale, T.ArrayType(T.DoubleType()))
+    return sdf.withColumn(output_col, udf(F.col(baseline_col), F.col(duration_col)))
+
