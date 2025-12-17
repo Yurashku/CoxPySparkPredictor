@@ -19,11 +19,14 @@ UNKNOWN_TYPE_NULL = "null"
 
 
 class _BroadcastArtifacts:
+    """Инкапсулирует артефакты и порядок признаков для передачи в broadcast-переменной."""
+
     def __init__(self, feature_order: List[str], artifacts: Dict[str, TypeArtifacts]):
         self.feature_order = feature_order
         self.artifacts = artifacts
 
     def make_survival_udf(self, unknown_policy: str, t: Optional[int]):
+        """Строит pandas UDF, использующую сохранённые артефакты для расчёта выживаемости."""
         feature_order = self.feature_order
         artifacts = self.artifacts
 
@@ -64,5 +67,6 @@ def build_survival_udf(
     unknown_policy: str,
     t: Optional[int],
 ):
+    """Создаёт и возвращает pandas UDF для инференса, завернутую в broadcast для уменьшения трафика."""
     broadcasted = spark.sparkContext.broadcast(_BroadcastArtifacts(feature_cols, artifacts))
     return broadcasted.value.make_survival_udf(unknown_policy=unknown_policy, t=t)
