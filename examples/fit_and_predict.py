@@ -1,39 +1,39 @@
-"""Minimal example for fitting and predicting survival with SparkCoxPHByType."""
+"""Полный цикл работы с BaselinePipeline на маленьком датасете."""
 import numpy as np
-import pandas as pd
+from pyspark.ml.linalg import Vectors
 from pyspark.sql import SparkSession
 
-from spark_lifelines_cox.model import SparkCoxPHByType
+from spark_lifelines_cox.model import BaselinePipeline, BaselinePipelineConfig
 
 
 if __name__ == "__main__":
-    spark = SparkSession.builder.master("local[*]").appName("example").getOrCreate()
+    spark = SparkSession.builder.master("local[*]").appName("baseline-example").getOrCreate()
 
-    rng = np.random.default_rng(0)
-    pdf = pd.DataFrame({
-        "type": np.where(rng.random(50) > 0.5, "A", "B"),
-        "duration": rng.exponential(scale=5, size=50),
-        "event": rng.binomial(1, 0.8, size=50),
-        "x": rng.normal(size=50),
-    })
-    sdf = spark.createDataFrame(pdf)
+    rng = np.random.default_rng(42)
+    rows = []
+    for key in ["alpha", "beta"]:
+        for _ in range(30):
+            duration = int(rng.integers(1, 10))
+            event = int(rng.binomial(1, 0.6))
+            features = Vectors.dense([float(rng.normal()), float(rng.normal())])
+            rows.append((key, duration, event, features))
 
-    model = SparkCoxPHByType(
-        type_col="type",
-        duration_col="duration",
-        event_col="event",
-        feature_cols=["x"],
-        max_rows_per_type=1000,
-    )
-    model.fit(sdf)
-    model.extend_baselines(max_time=30)
+    sdf = spark.createDataFrame(rows, ["model_key", "duration", "event", "x"])
 
-    pred = model.predict_survival_at_t(sdf, t=10)
-    pred.show(5, truncate=False)
+    config = BaselinePipelineConfig(max_baseline_length=48, tail_cycle=12, sample_fraction=0.8, seed=7)
+    pipeline = BaselinePipeline(config)
+    pipeline.fit(sdf)
 
-    model.save("/tmp/cox_model.csv")
-    loaded = SparkCoxPHByType.load("/tmp/cox_model.csv")
-    pred2 = loaded.predict_survival_at_t(sdf, t=10)
-    pred2.show(5, truncate=False)
+    pipeline.save("/tmp/baseline_csv")
+    restored = BaselinePipeline.load("/tmp/baseline_csv")
+
+    with_baseline = restored.infer_baseline(sdf, output_col="baseline")
+    adjusted = restored.adjust_for_lived(with_baseline, duration_col="duration", baseline_col="baseline", output_col="tail")
+
+    print("=== Baseline ===")
+    with_baseline.show(5, truncate=False)
+
+    print("=== Tail adjusted for lived duration ===")
+    adjusted.select("model_key", "duration", "tail").show(5, truncate=False)
 
     spark.stop()
