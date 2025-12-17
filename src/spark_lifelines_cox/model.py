@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import logging
 import json
-from typing import Callable, Dict, Iterable, Optional
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -11,14 +13,116 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col
 from pyspark.sql.types import StringType, StructField, StructType
 
-from .artifacts import TrainingResult, TypeArtifacts
-from .io import load_artifacts, save_artifacts
 from .sampling import cap_sample_by_key
 from .schemas import cast_columns, ensure_columns_exist
-from .udfs import build_period_prob_udf, build_survival_udf
-from .utils import CoxModelError, now_utc_iso
+from .udfs import build_survival_udf
+from .utils import CoxModelError, now_utc_iso, safe_json_dump, safe_json_load
 
 logger = logging.getLogger(__name__)
+
+CSV_FILENAME = "artifacts.csv"
+CONFIG_ROW_TYPE = "__config__"
+
+
+@dataclass
+class TypeArtifacts:
+    type_value: str
+    beta: Dict[str, float]
+    mean_: Dict[str, float]
+    baseline_survival: List[float]
+    baseline_ratio: List[float]
+    sample_size: int
+    event_count: int
+    fitted_at: str
+    penalizer: Optional[float]
+    l1_ratio: Optional[float]
+    feature_cols: List[str]
+    baseline_method: str
+
+    def survival_at(self, t: int) -> float:
+        if t < 0:
+            return 1.0
+        if t < len(self.baseline_survival):
+            return float(self.baseline_survival[t])
+        return float(self.baseline_survival[-1])
+
+    def extend_baseline(self, max_time: int, extend_fn=None, tail_k: int = 6) -> None:
+        current_T = len(self.baseline_survival) - 1
+        if max_time <= current_T:
+            return
+        tail_start = max(1, len(self.baseline_ratio) - tail_k)
+        tail_values = np.array(self.baseline_ratio[tail_start:])
+        if extend_fn is None:
+            fill_values = float(np.mean(tail_values)) if len(tail_values) else 1.0
+            new_ratios = np.full(max_time - current_T, fill_values, dtype=float)
+        else:
+            new_times = np.arange(current_T + 1, max_time + 1, dtype=int)
+            new_ratios = np.array(extend_fn(tail_values, new_times), dtype=float)
+        last_survival = self.baseline_survival[-1]
+        cumulative = last_survival * np.cumprod(new_ratios)
+        self.baseline_ratio.extend(new_ratios.tolist())
+        self.baseline_survival.extend(cumulative.tolist())
+
+
+@dataclass
+class TrainingResult:
+    artifacts_by_type: Dict[str, TypeArtifacts] = field(default_factory=dict)
+    skipped: Dict[str, str] = field(default_factory=dict)
+
+    def add(self, type_value: str, artifacts: Optional[TypeArtifacts], reason: Optional[str]) -> None:
+        if artifacts is not None:
+            self.artifacts_by_type[type_value] = artifacts
+        elif reason:
+            self.skipped[type_value] = reason
+
+
+def _resolve_csv_path(path: str) -> str:
+    if path.endswith(".csv"):
+        return path
+    return os.path.join(path, CSV_FILENAME)
+
+
+def save_artifacts(path: str, artifacts: Dict[str, TypeArtifacts], skipped: Dict[str, str], config: Dict[str, object]) -> None:
+    csv_path = _resolve_csv_path(path)
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    rows = []
+    rows.append(
+        {
+            "type": CONFIG_ROW_TYPE,
+            "payload": safe_json_dump(config),
+            "status": "config",
+        }
+    )
+    for t, art in artifacts.items():
+        rows.append({"type": t, "payload": safe_json_dump(art.__dict__), "status": "ok"})
+    for t, reason in skipped.items():
+        rows.append({"type": t, "payload": None, "status": reason})
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+
+def load_artifacts(path: str) -> Tuple[Dict[str, TypeArtifacts], Dict[str, str], Dict[str, object]]:
+    csv_path = _resolve_csv_path(path)
+    if not os.path.exists(csv_path):
+        raise CoxModelError(f"Artifacts file not found at {csv_path}")
+    df = pd.read_csv(csv_path)
+    config: Dict[str, object] = {}
+    artifacts: Dict[str, TypeArtifacts] = {}
+    skipped: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        row_type = str(row["type"])
+        status = None if pd.isna(row.get("status")) else str(row.get("status"))
+        if row_type == CONFIG_ROW_TYPE:
+            payload = row.get("payload")
+            config = safe_json_load(payload) if isinstance(payload, str) else {}
+            continue
+        if status == "ok":
+            payload = row.get("payload")
+            if not isinstance(payload, str):
+                continue
+            artifacts[row_type] = TypeArtifacts(**safe_json_load(payload))
+        else:
+            skipped[row_type] = status or "skipped"
+    return artifacts, skipped, config
 
 
 class SparkCoxPHByType:
@@ -180,20 +284,6 @@ class SparkCoxPHByType:
         result = sdf.withColumn(output_col, udf(*cols))
         return result
 
-    def predict_period_event_prob(
-        self, sdf: DataFrame, period_col: str, output_col: str = "p_event"
-    ) -> DataFrame:
-        ensure_columns_exist(sdf, [self.type_col, period_col, *self.feature_cols])
-        sdf = cast_columns(sdf, {period_col: "int", **{c: "double" for c in self.feature_cols}})
-        udf = build_period_prob_udf(
-            spark=self.spark,
-            artifacts=self.artifacts,
-            feature_cols=self.feature_cols,
-            unknown_policy=self.unknown_type_policy,
-        )
-        cols = [col(self.type_col)] + [col(c) for c in self.feature_cols] + [col(period_col)]
-        return sdf.withColumn(output_col, udf(*cols))
-
     def save(self, path: str) -> None:
         save_artifacts(path, self.artifacts, self.skipped, self._config_dict())
 
@@ -235,3 +325,23 @@ class SparkCoxPHByType:
         model.artifacts = artifacts
         model.skipped = skipped
         return model
+
+    @classmethod
+    def from_config(cls, path: str) -> "SparkCoxPHByType":
+        _, _, config = load_artifacts(path)
+        if not config:
+            raise CoxModelError("No configuration found in artifacts file")
+        return cls(
+            type_col=config.get("type_col", "type"),
+            duration_col=config.get("duration_col", "duration"),
+            event_col=config.get("event_col", "event"),
+            feature_cols=config.get("feature_cols", []),
+            max_rows_per_type=int(config.get("max_rows_per_type", 0)),
+            min_events_per_type=int(config.get("min_events_per_type", 0)),
+            penalizer=config.get("penalizer"),
+            l1_ratio=config.get("l1_ratio"),
+            baseline_estimation_method=config.get("baseline_estimation_method", "breslow"),
+            seed=config.get("seed"),
+            unknown_type_policy=config.get("unknown_type_policy", "null"),
+            null_policy=config.get("null_policy", "nan"),
+        )
