@@ -1,7 +1,7 @@
 import pandas as pd
 from pyspark.sql import functions as F
 
-from spark_lifelines_cox.sampling import cap_sample_by_key
+from spark_lifelines_cox.utils import cap_sample_by_key
 
 
 def test_cap_sampling_deterministic(spark):
