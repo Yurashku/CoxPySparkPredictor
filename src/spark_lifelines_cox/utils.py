@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable
 
 import numpy as np
 from lifelines import CoxPHFitter
@@ -15,8 +15,8 @@ from pyspark.sql import types as T
 @dataclass
 class BaselineModel:
     model_key: str
-    weights: List[float]
-    baseline_survival: List[float]
+    weights: list[float]
+    baseline_survival: list[float]
     sample_size: int
 
 
@@ -38,7 +38,7 @@ def _vector_to_columns(pdf, vector_col: str, prefix: str = "f"):
     return pdf.drop(columns=[vector_col]), [f"{prefix}{idx}" for idx in range(size)]
 
 
-def _hazard_sequence(cph: CoxPHFitter) -> List[float]:
+def _hazard_sequence(cph: CoxPHFitter) -> list[float]:
     hazard_series = cph.baseline_hazard_.iloc[:, 0]
     durations = [int(round(v)) for v in hazard_series.index.to_list()]
     values = hazard_series.to_list()
@@ -46,7 +46,7 @@ def _hazard_sequence(cph: CoxPHFitter) -> List[float]:
         return []
 
     max_t = max(durations)
-    hazard: List[float] = []
+    hazard: list[float] = []
     last_value = values[0]
     duration_iter = iter(zip(durations, values))
     current_duration, current_value = next(duration_iter)
@@ -62,7 +62,7 @@ def _hazard_sequence(cph: CoxPHFitter) -> List[float]:
     return hazard
 
 
-def _extend_hazard(hazard: List[float], target_length: int, tail_cycle: int = 12) -> List[float]:
+def _extend_hazard(hazard: list[float], target_length: int, tail_cycle: int = 12) -> list[float]:
     if target_length <= len(hazard):
         return hazard[:target_length]
     if not hazard:
@@ -72,7 +72,7 @@ def _extend_hazard(hazard: List[float], target_length: int, tail_cycle: int = 12
     return hazard + cycle
 
 
-def _hazard_to_survival(hazard: List[float]) -> List[float]:
+def _hazard_to_survival(hazard: list[float]) -> list[float]:
     survival = [1.0]
     for h in hazard:
         survival.append(float(survival[-1] * np.exp(-h)))
@@ -87,7 +87,7 @@ def build_baseline_model(
     vector_col: str,
     max_length: int,
     tail_cycle: int,
-) -> Optional[BaselineModel]:
+) -> BaselineModel | None:
     if len(pdf) == 0:
         return None
     if pdf[event_col].sum() == 0:
@@ -111,15 +111,20 @@ def build_baseline_model(
     )
 
 
-def save_models(path: str, config: Dict[str, object], models: Dict[str, BaselineModel]) -> None:
+def save_models(path: str, config: dict[str, object], models: dict[str, BaselineModel]) -> None:
     rows = [
-        {"type": CONFIG_ROW_TYPE, "payload": json.dumps(config, ensure_ascii=False, separators=(",", ":"))}
+        {
+            "type": CONFIG_ROW_TYPE,
+            "payload": json.dumps(config, ensure_ascii=False, separators=(",", ":")),
+        }
     ]
     for key, model in models.items():
-        rows.append({
-            "type": key,
-            "payload": json.dumps(model.__dict__, ensure_ascii=False, separators=(",", ":")),
-        })
+        rows.append(
+            {
+                "type": key,
+                "payload": json.dumps(model.__dict__, ensure_ascii=False, separators=(",", ":")),
+            }
+        )
     schema = T.StructType(
         [
             T.StructField("type", T.StringType(), False),
@@ -129,17 +134,19 @@ def save_models(path: str, config: Dict[str, object], models: Dict[str, Baseline
     spark = SparkSession.getActiveSession()
     if spark is None:
         raise RuntimeError("Spark session is not active")
-    spark.createDataFrame(rows, schema=schema).coalesce(1).write.mode("overwrite").csv(path, header=True)
+    spark.createDataFrame(rows, schema=schema).coalesce(1).write.mode("overwrite").csv(
+        path, header=True
+    )
 
 
-def load_models(path: str) -> tuple[Dict[str, BaselineModel], Dict[str, object]]:
+def load_models(path: str) -> tuple[dict[str, BaselineModel], dict[str, object]]:
     spark = SparkSession.getActiveSession()
     if spark is None:
         raise RuntimeError("Spark session is not active")
     df = spark.read.option("header", True).csv(path)
     rows = df.collect()
-    models: Dict[str, BaselineModel] = {}
-    config: Dict[str, object] = {}
+    models: dict[str, BaselineModel] = {}
+    config: dict[str, object] = {}
     for row in rows:
         payload = json.loads(row["payload"])
         if row["type"] == CONFIG_ROW_TYPE:
@@ -149,7 +156,7 @@ def load_models(path: str) -> tuple[Dict[str, BaselineModel], Dict[str, object]]
     return models, config
 
 
-def build_baseline_column(models: Dict[str, BaselineModel]) -> F.Column:
+def build_baseline_column(models: dict[str, BaselineModel]) -> F.Column:
     items = []
     for key, model in models.items():
         items.append(F.lit(key))
@@ -158,13 +165,17 @@ def build_baseline_column(models: Dict[str, BaselineModel]) -> F.Column:
     return F.create_map(*items)
 
 
-def attach_baseline(sdf: DataFrame, key_col: str, models: Dict[str, BaselineModel], output_col: str) -> DataFrame:
+def attach_baseline(
+    sdf: DataFrame, key_col: str, models: dict[str, BaselineModel], output_col: str
+) -> DataFrame:
     mapping_col = build_baseline_column(models)
     return sdf.withColumn(output_col, mapping_col.getItem(F.col(key_col)))
 
 
-def adjust_survival_tail(sdf: DataFrame, duration_col: str, baseline_col: str, output_col: str) -> DataFrame:
-    def _trim_and_scale(baseline: Optional[List[float]], lived: Optional[int]):
+def adjust_survival_tail(
+    sdf: DataFrame, duration_col: str, baseline_col: str, output_col: str
+) -> DataFrame:
+    def _trim_and_scale(baseline: list[float] | None, lived: int | None):
         if baseline is None or lived is None:
             return None
         lived_int = int(lived)
@@ -180,4 +191,3 @@ def adjust_survival_tail(sdf: DataFrame, duration_col: str, baseline_col: str, o
 
     udf = F.udf(_trim_and_scale, T.ArrayType(T.DoubleType()))
     return sdf.withColumn(output_col, udf(F.col(baseline_col), F.col(duration_col)))
-

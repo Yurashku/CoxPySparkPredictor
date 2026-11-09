@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -31,9 +30,9 @@ class BaselinePipelineConfig:
 class BaselinePipeline:
     """Полный цикл: обучение бейзлайнов, продление, сохранение, загрузка и инференс."""
 
-    def __init__(self, config: Optional[BaselinePipelineConfig] = None):
+    def __init__(self, config: BaselinePipelineConfig | None = None):
         self.config = config or BaselinePipelineConfig()
-        self.models: Dict[str, BaselineModel] = {}
+        self.models: dict[str, BaselineModel] = {}
 
     @property
     def spark(self) -> SparkSession:
@@ -42,7 +41,7 @@ class BaselinePipeline:
             raise RuntimeError("Spark session is not active")
         return spark
 
-    def fit(self, sdf: DataFrame) -> "BaselinePipeline":
+    def fit(self, sdf: DataFrame) -> BaselinePipeline:
         c = self.config
         required = [c.model_key_col, c.duration_col, c.event_col, c.vector_col]
         missing = [col for col in required if col not in sdf.columns]
@@ -55,7 +54,7 @@ class BaselinePipeline:
         )
 
         keys = [r[0] for r in sdf.select(c.model_key_col).distinct().collect()]
-        models: Dict[str, BaselineModel] = {}
+        models: dict[str, BaselineModel] = {}
         for key in keys:
             keyed = sdf.filter(F.col(c.model_key_col) == F.lit(key))
             if c.sample_fraction < 1.0:
@@ -82,7 +81,7 @@ class BaselinePipeline:
         save_models(path, config=config_dict, models=self.models)
 
     @classmethod
-    def load(cls, path: str) -> "BaselinePipeline":
+    def load(cls, path: str) -> BaselinePipeline:
         pipeline = cls()
         models, config = load_models(path)
         pipeline.models = models
@@ -92,14 +91,18 @@ class BaselinePipeline:
     def infer_baseline(self, sdf: DataFrame, output_col: str = "baseline") -> DataFrame:
         if not self.models:
             raise RuntimeError("No baselines loaded. Call fit or load first.")
-        return attach_baseline(sdf, key_col=self.config.model_key_col, models=self.models, output_col=output_col)
+        return attach_baseline(
+            sdf, key_col=self.config.model_key_col, models=self.models, output_col=output_col
+        )
 
     def adjust_for_lived(
         self,
         sdf: DataFrame,
-        duration_col: Optional[str] = None,
+        duration_col: str | None = None,
         baseline_col: str = "baseline",
         output_col: str = "adjusted_baseline",
     ) -> DataFrame:
         duration_col = duration_col or self.config.duration_col
-        return adjust_survival_tail(sdf, duration_col=duration_col, baseline_col=baseline_col, output_col=output_col)
+        return adjust_survival_tail(
+            sdf, duration_col=duration_col, baseline_col=baseline_col, output_col=output_col
+        )

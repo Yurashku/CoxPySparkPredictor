@@ -38,7 +38,9 @@ def test_full_cycle_save_load_and_adjust(spark, tmp_path):
     sample_row = with_baseline.limit(1).collect()[0]
     assert len(sample_row.baseline) == config.max_baseline_length + 1
 
-    adjusted = loaded.adjust_for_lived(with_baseline, duration_col="duration", baseline_col="baseline")
+    adjusted = loaded.adjust_for_lived(
+        with_baseline, duration_col="duration", baseline_col="baseline"
+    )
     adjusted_row = adjusted.limit(1).collect()[0]
     assert adjusted_row.adjusted_baseline[0] == 1.0
     assert len(adjusted_row.adjusted_baseline) == len(sample_row.baseline) - sample_row.duration
