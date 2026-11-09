@@ -1,6 +1,8 @@
 # CoxPySparkPredictor
 
-Репозиторий реализует единственный пайплайн, который обучает и применяет базовые кривые выживаемости для набора категориальных моделей (`model_key`) на данных PySpark. Все шаги строго следуют требованиям:
+**Grouped Cox baseline survival pipelines with PySpark and lifelines.** Fit a Cox model per key, extend its baseline curve, persist artifacts, and attach a conditional survival tail to Spark rows. This is a research implementation with a fixed older dependency stack.
+
+Репозиторий реализует единственный пайплайн, который обучает и применяет базовые кривые выживаемости для набора категориальных моделей (`model_key`) на данных PySpark. Пайплайн включает пять шагов:
 
 1. **Сэмплирование и обучение:** для каждого `model_key` берётся (опционально) подвыборка строк, из которой оцениваются веса признаков и базовый hazard/выживаемость с помощью `lifelines.CoxPHFitter`. Столбец `duration` всегда приводится к целому.
 2. **Продление бейзлайна:** полученный hazard циклически продолжает последние 12 значений до заданной длины горизонта (`max_baseline_length`).
@@ -8,7 +10,12 @@
 4. **Загрузка и инференс:** артефакты читаются из CSV, после чего можно восстанавливать полный бейзлайн для новых объектов по их `model_key`.
 5. **Учёт прожитого срока:** у «живых» объектов хвост бейзлайна обрезается на `duration` точек и нормируется так, чтобы новая кривальная часть начиналась с единицы (мы учитываем факт, что объект уже прожил `duration`).
 
-Никакого дополнительного функционала нет: только перечисленные шаги и вспомогательные функции, необходимые для их выполнения.
+**Граница реализации:** `infer_baseline` прикрепляет одну групповую baseline-кривую
+по `model_key`. Хотя коэффициенты Cox сохраняются в артефакте, при этом вызове
+они не используются для индивидуального прогноза по вектору `x`. Обучение группы
+проходит в `lifelines` после `toPandas()`; данные отдельной группы должны помещаться
+в памяти driver. Spark здесь организует подготовку, хранение и применение кривых,
+а не распределённую оптимизацию Cox.
 
 ## Требования к данным
 
@@ -21,39 +28,64 @@
 
 ## Установка
 
+Для воспроизведения используйте Python 3.10, выбранный в CI проекта, и JDK 11.
+В `pyproject.toml` закреплён PySpark 3.2.1 и ограничены версии NumPy, pandas, SciPy
+и Arrow; установка в современное окружение Python без этих ограничений не является
+проверенной конфигурацией. [Документация Spark 3.2.1](https://archive.apache.org/dist/spark/docs/3.2.1/)
+указывает поддержку Java 8/11; настройте `JAVA_HOME` на совместимый JDK.
+
 ```bash
-pip install -e .[dev]
+git clone https://github.com/Yurashku/CoxPySparkPredictor.git
+cd CoxPySparkPredictor
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
-> Spark 3.2.1 требует JDK 8–11. Убедитесь, что `JAVA_HOME` указывает на совместимую версию (например, `/usr/lib/jvm/java-11-openjdk-amd64`).
+В Windows создайте окружение командой `py -3.10 -m venv .venv` и активируйте его
+через `.\.venv\Scripts\Activate.ps1`. Для первого знакомства удобнее Linux/WSL
+с указанным JDK. Запуск Spark в рамках обновления этого README не проверялся.
+
+Последний доступный [CI для текущей ревизии](https://github.com/Yurashku/CoxPySparkPredictor/actions/runs/20306904720)
+завершился ошибкой. Наличие теста в репозитории пока не является подтверждением
+успешного полного цикла в опубликованной конфигурации.
 
 ## Быстрый пример
 
+Готовый скрипт создаёт по 30 синтетических наблюдений для двух групп, обучает модели,
+сохраняет и загружает CSV-артефакты и выводит baseline и условный хвост:
+
+```bash
+python examples/fit_and_predict.py
+```
+
+Он использует путь `/tmp/baseline_csv` и перезаписывает его. Запускайте в отдельной
+рабочей среде либо укажите в скрипте свой свободный каталог. При горизонте 48
+массив baseline содержит 49 точек, включая начальную 1.0; хвост нормируется на
+значение в момент уже прожитого срока. Это ожидаемая структура по коду, а не
+новый результат локального прогона.
+
+Минимальный вызов после подготовки Spark DataFrame `sdf`:
+
 ```python
-from pyspark.sql import SparkSession
-from pyspark.ml.linalg import Vectors
 from spark_lifelines_cox.model import BaselinePipeline, BaselinePipelineConfig
 
-spark = SparkSession.builder.master("local[*]").getOrCreate()
-
-rows = [
-    ("A", 3, 1, Vectors.dense([0.1, -0.2])),
-    ("A", 5, 0, Vectors.dense([0.3, 0.4])),
-    ("B", 2, 1, Vectors.dense([-0.5, 0.7])),
-]
-sdf = spark.createDataFrame(rows, ["model_key", "duration", "event", "x"])
-
-config = BaselinePipelineConfig(max_baseline_length=36, tail_cycle=12, sample_fraction=1.0)
-pipeline = BaselinePipeline(config)
+pipeline = BaselinePipeline(BaselinePipelineConfig(max_baseline_length=48))
 pipeline.fit(sdf)
-pipeline.save("/tmp/baseline_csv")
+with_baseline = pipeline.infer_baseline(sdf, output_col="baseline")
+adjusted = pipeline.adjust_for_lived(
+    with_baseline, duration_col="duration",
+    baseline_col="baseline", output_col="tail",
+)
+adjusted.select("model_key", "duration", "tail").show(5, truncate=False)
+```
 
-loaded = BaselinePipeline.load("/tmp/baseline_csv")
-with_baseline = loaded.infer_baseline(sdf, output_col="baseline")
-adjusted = loaded.adjust_for_lived(with_baseline, duration_col="duration", baseline_col="baseline", output_col="tail")
+Для Cox нужны достаточно большие группы, события и невырожденные признаки.
+Пример из нескольких строк на группу может не сойтись и не годится для проверки
+модели. Существующий сквозной тест запускается так:
 
-with_baseline.show(truncate=False)
-adjusted.show(truncate=False)
+```bash
+python -m pytest tests/test_pipeline.py -q
 ```
 
 ## Что внутри
@@ -73,10 +105,22 @@ adjusted.show(truncate=False)
 
 ## Примечания по использованию
 
-- Если для какого-то `model_key` данных нет, бейзлайн для него не строится.
-- При обрезке хвостов для «живых» объектов пустой или слишком короткий бейзлайн заменяется на `[1.0]`, чтобы не возвращать пустые массивы.
+- Если для какого-то `model_key` данных нет или в группе нет событий, бейзлайн для него не строится. При применении неизвестный ключ даёт `null`.
+- Если прожитый срок выходит за длину известного бейзлайна, возвращается `[1.0]`. Отсутствующий бейзлайн или срок даёт `null`; нулевое значение в точке нормировки даёт `NaN` в хвосте.
 - Сохранение идёт в формате Spark CSV (каталог с одним файлом), поэтому при передаче пути нужно указывать директорию, а не конечный файл.
 
 ## Обновление артефактов
 
 Каждое видоизменение кода сопровождается обновлением `README.md` и примеров. Все Jupyter-ноутбуки должны быть прогнаны до конца и сохранены с актуальными выводами перед коммитом.
+
+## Ограничения и происхождение
+
+Циклическое продолжение последних hazard-значений — выбранное правило экстраполяции,
+а не проверенное свойство будущей выживаемости. Калибровку, предположение
+пропорциональных рисков и качество на целевых данных нужно оценивать отдельно.
+
+[Добавление baseline-пайплайна](https://github.com/Yurashku/CoxPySparkPredictor/commit/b3353b8295977de77e216d766896689cc8137ca4)
+и [история проекта](https://github.com/Yurashku/CoxPySparkPredictor/commits/main/)
+позволяют проследить вклад в репозиторий Yurashku. Метаданные пакета сохраняют
+автора `CODEX`; README не представляет эту историю как полностью ручную разработку.
+Лицензия — [Apache 2.0](https://github.com/Yurashku/CoxPySparkPredictor/blob/main/LICENSE).
